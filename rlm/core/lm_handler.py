@@ -11,6 +11,7 @@ from rlm.core.types import RLMChatCompletion, UsageSummary
 from typing import Optional, Dict
 from socketserver import ThreadingTCPServer, StreamRequestHandler
 from threading import Thread
+import asyncio
 import time
 
 
@@ -26,35 +27,73 @@ class LMRequestHandler(StreamRequestHandler):
                 return
 
             request = LMRequest.from_dict(request_data)
-            if not request.prompt:
-                response = LMResponse.error_response(
-                    "Missing or invalid 'prompt' in request."
-                )
-                socket_send(self.connection, response.to_dict())
-                return
-
             handler: LMHandler = self.server.lm_handler  # type: ignore
-            client = handler.get_client(request.model)
 
-            start_time = time.perf_counter()
-            content = client.completion(request.prompt)
-            end_time = time.perf_counter()
-
-            usage_summary = client.get_last_usage()
-            response = LMResponse.success_response(
-                chat_completion=RLMChatCompletion(
-                    root_model=request.model,
-                    prompt=request.prompt,
-                    response=content,
-                    usage_summary=usage_summary,
-                    execution_time=end_time - start_time,
+            if request.is_batched:
+                # Batched request: process multiple prompts concurrently
+                response = self._handle_batched(request, handler)
+            elif request.prompt:
+                # Single request: process one prompt
+                response = self._handle_single(request, handler)
+            else:
+                response = LMResponse.error_response(
+                    "Missing 'prompt' or 'prompts' in request."
                 )
-            )
+
             socket_send(self.connection, response.to_dict())
 
         except Exception as e:
             response = LMResponse.error_response(str(e))
             socket_send(self.connection, response.to_dict())
+
+    def _handle_single(self, request: LMRequest, handler: "LMHandler") -> LMResponse:
+        """Handle a single prompt request."""
+        client = handler.get_client(request.model)
+
+        start_time = time.perf_counter()
+        content = client.completion(request.prompt)
+        end_time = time.perf_counter()
+
+        usage_summary = client.get_last_usage()
+        return LMResponse.success_response(
+            chat_completion=RLMChatCompletion(
+                root_model=request.model,
+                prompt=request.prompt,
+                response=content,
+                usage_summary=usage_summary,
+                execution_time=end_time - start_time,
+            )
+        )
+
+    def _handle_batched(self, request: LMRequest, handler: "LMHandler") -> LMResponse:
+        """Handle a batched prompts request using async for concurrency."""
+        client = handler.get_client(request.model)
+
+        start_time = time.perf_counter()
+
+        async def run_all():
+            tasks = [client.acompletion(prompt) for prompt in request.prompts]
+            return await asyncio.gather(*tasks)
+
+        results = asyncio.run(run_all())
+        end_time = time.perf_counter()
+
+        total_time = end_time - start_time
+        usage_summary = client.get_last_usage()
+
+        chat_completions = [
+            RLMChatCompletion(
+                root_model=request.model,
+                prompt=prompt,
+                response=content,
+                usage_summary=usage_summary,
+                execution_time=total_time
+                / len(request.prompts),  # approximate per-prompt time
+            )
+            for prompt, content in zip(request.prompts, results)
+        ]
+
+        return LMResponse.batched_success_response(chat_completions=chat_completions)
 
 
 class ThreadingLMServer(ThreadingTCPServer):

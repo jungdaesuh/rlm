@@ -6,7 +6,7 @@ Used for communication between LMHandler and environment subprocesses.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
 import socket
 import struct
 import json
@@ -20,14 +20,27 @@ from rlm.core.types import RLMChatCompletion
 
 @dataclass
 class LMRequest:
-    """Request message sent to the LM Handler."""
+    """Request message sent to the LM Handler.
 
-    prompt: str | Dict[str, Any]
+    Supports both single prompt (prompt field) and batched prompts (prompts field).
+    """
+
+    prompt: Optional[str | Dict[str, Any]] = None
+    prompts: Optional[List[str | Dict[str, Any]]] = None
     model: Optional[str] = None
+
+    @property
+    def is_batched(self) -> bool:
+        """Check if this is a batched request."""
+        return self.prompts is not None and len(self.prompts) > 0
 
     def to_dict(self) -> dict:
         """Convert to dict, excluding None values."""
-        d = {"prompt": self.prompt}
+        d = {}
+        if self.prompt is not None:
+            d["prompt"] = self.prompt
+        if self.prompts is not None:
+            d["prompts"] = self.prompts
         if self.model is not None:
             d["model"] = self.model
         return d
@@ -36,48 +49,84 @@ class LMRequest:
     def from_dict(cls, data: dict) -> "LMRequest":
         """Create from dict."""
         return cls(
-            prompt=data.get("prompt", ""),
+            prompt=data.get("prompt"),
+            prompts=data.get("prompts"),
             model=data.get("model"),
         )
 
 
 @dataclass
 class LMResponse:
-    """Response message from the LM Handler."""
+    """Response message from the LM Handler.
+
+    Supports both single response (chat_completion) and batched responses (chat_completions).
+    """
 
     error: Optional[str] = None
     chat_completion: Optional[RLMChatCompletion] = None
+    chat_completions: Optional[List[RLMChatCompletion]] = None
 
     @property
     def success(self) -> bool:
         """Check if response was successful."""
         return self.error is None
 
+    @property
+    def is_batched(self) -> bool:
+        """Check if this is a batched response."""
+        return self.chat_completions is not None
+
     def to_dict(self) -> dict:
         """Convert to dict, excluding None values."""
         if self.error is not None:
-            return {"error": self.error, "chat_completion": None}
+            return {
+                "error": self.error,
+                "chat_completion": None,
+                "chat_completions": None,
+            }
+        if self.chat_completions is not None:
+            return {
+                "chat_completions": [c.to_dict() for c in self.chat_completions],
+                "chat_completion": None,
+                "error": None,
+            }
         if self.chat_completion is not None:
-            return {"chat_completion": self.chat_completion.to_dict(), "error": None}
+            return {
+                "chat_completion": self.chat_completion.to_dict(),
+                "chat_completions": None,
+                "error": None,
+            }
         return {
             "error": "No chat completion or error provided.",
             "chat_completion": None,
+            "chat_completions": None,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "LMResponse":
         """Create from dict."""
+        chat_completions = None
+        if data.get("chat_completions"):
+            chat_completions = [
+                RLMChatCompletion.from_dict(c) for c in data["chat_completions"]
+            ]
         return cls(
             error=data.get("error"),
             chat_completion=RLMChatCompletion.from_dict(data.get("chat_completion")),
+            chat_completions=chat_completions,
         )
 
     @classmethod
     def success_response(cls, chat_completion: RLMChatCompletion) -> "LMResponse":
-        """Create a successful response."""
-        return cls(
-            chat_completion=chat_completion,
-        )
+        """Create a successful single response."""
+        return cls(chat_completion=chat_completion)
+
+    @classmethod
+    def batched_success_response(
+        cls, chat_completions: List[RLMChatCompletion]
+    ) -> "LMResponse":
+        """Create a successful batched response."""
+        return cls(chat_completions=chat_completions)
 
     @classmethod
     def error_response(cls, error: str) -> "LMResponse":
@@ -166,3 +215,41 @@ def send_lm_request(
         return LMResponse.from_dict(response_data)
     except Exception as e:
         return LMResponse.error_response(f"Request failed: {e}")
+
+
+def send_lm_request_batched(
+    address: Tuple[str, int],
+    prompts: List[str | Dict[str, Any]],
+    model: Optional[str] = None,
+    timeout: int = 300,
+) -> List[LMResponse]:
+    """Send a batched LM request and return a list of typed responses.
+
+    Args:
+        address: (host, port) tuple of LM Handler server.
+        prompts: List of prompts to send.
+        model: Optional model name to use.
+        timeout: Socket timeout in seconds.
+
+    Returns:
+        List of LMResponse objects, one per prompt, in the same order.
+    """
+    try:
+        request = LMRequest(prompts=prompts, model=model)
+        response_data = socket_request(address, request.to_dict(), timeout)
+        response = LMResponse.from_dict(response_data)
+
+        if not response.success:
+            # Return error responses for all prompts
+            return [LMResponse.error_response(response.error)] * len(prompts)
+
+        if response.chat_completions is None:
+            return [LMResponse.error_response("No completions returned")] * len(prompts)
+
+        # Convert batched response to list of individual responses
+        return [
+            LMResponse.success_response(chat_completion)
+            for chat_completion in response.chat_completions
+        ]
+    except Exception as e:
+        return [LMResponse.error_response(f"Request failed: {e}")] * len(prompts)

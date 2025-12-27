@@ -1,5 +1,5 @@
 from rlm.environments.base_env import NonIsolatedEnv
-from rlm.core.comms_utils import send_lm_request, LMRequest
+from rlm.core.comms_utils import send_lm_request, send_lm_request_batched, LMRequest
 from rlm.core.types import RLMChatCompletion, REPLResult
 
 from typing import Optional, Any, Tuple, List
@@ -158,6 +158,7 @@ class LocalREPL(NonIsolatedEnv):
         # Add helper functions
         self.globals["FINAL_VAR"] = self._final_var
         self.globals["llm_query"] = self._llm_query
+        self.globals["llm_query_batched"] = self._llm_query_batched
 
     def _final_var(self, variable_name: str) -> str:
         """Return the value of a variable as a final answer."""
@@ -191,6 +192,39 @@ class LocalREPL(NonIsolatedEnv):
             return response.chat_completion.response
         except Exception as e:
             return f"Error: LM query failed - {e}"
+
+    def _llm_query_batched(
+        self, prompts: List[str], model: Optional[str] = None
+    ) -> List[str]:
+        """Query the LM with multiple prompts concurrently.
+
+        Args:
+            prompts: List of prompts to send to the LM.
+            model: Optional model name to use (if handler has multiple clients).
+
+        Returns:
+            List of responses in the same order as input prompts.
+        """
+        if not self.lm_handler_address:
+            return ["Error: No LM handler configured"] * len(prompts)
+
+        try:
+            responses = send_lm_request_batched(
+                self.lm_handler_address, prompts, model=model
+            )
+
+            results = []
+            for response in responses:
+                if not response.success:
+                    results.append(f"Error: {response.error}")
+                else:
+                    # Track this LLM call in list of all calls -- we may want to do this hierarchically
+                    self._pending_llm_calls.append(response.chat_completion)
+                    results.append(response.chat_completion.response)
+
+            return results
+        except Exception as e:
+            return [f"Error: LM query failed - {e}"] * len(prompts)
 
     def load_context(self, context_payload: dict | list | str):
         """Load context into the environment."""

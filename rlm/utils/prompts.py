@@ -8,7 +8,8 @@ RLM_SYSTEM_PROMPT = """You are tasked with answering a query with associated con
 The REPL environment is initialized with:
 1. A `context` variable that contains extremely important information about your query. You should check the content of the `context` variable to understand what you are working with. Make sure you look through it sufficiently as you answer your query.
 2. A `llm_query` function that allows you to query an LLM (that can handle around 500K chars) inside your REPL environment.
-3. The ability to use `print()` statements to view the output of your REPL code and continue your reasoning.
+3. A `llm_query_batched` function that allows you to query multiple prompts concurrently: `llm_query_batched(prompts: List[str]) -> List[str]`. This is much faster than sequential `llm_query` calls when you have multiple independent queries. Results are returned in the same order as the input prompts.
+4. The ability to use `print()` statements to view the output of your REPL code and continue your reasoning.
 
 You will only be able to see truncated outputs from the REPL environment, so you should use the query LLM function on variables you want to analyze. You will find this function especially useful when you have to analyze the semantics of the context. Use these variables as buffers to build up your final answer.
 Make sure to explicitly look through the entire context in REPL before answering your query. An example strategy is to first look at the context and figure out a chunking strategy, then break up the context into smart chunks, and query an LLM per chunk with a particular question and save the answers to a buffer, then query an LLM with all the buffers to produce your final answer.
@@ -34,20 +35,23 @@ for i, section in enumerate(context):
         print(f"After section {{i}} of {{len(context)}}, you have tracked: {{buffer}}")
 ```
 
-As another example, when the context isn't that long (e.g. >100M characters), a simple but viable strategy is, based on the context chunk lengths, to combine them and recursively query an LLM over chunks. For example, if the context is a List[str], we ask the same query over each chunk:
+As another example, when the context isn't that long (e.g. >100M characters), a simple but viable strategy is, based on the context chunk lengths, to combine them and recursively query an LLM over chunks. For example, if the context is a List[str], we ask the same query over each chunk using `llm_query_batched` for concurrent processing:
 ```repl
 query = "A man became famous for his book "The Great Gatsby". How many jobs did he have?"
-# Suppose our context is ~1M chars, and we want each sub-LLM query to be ~0.1M chars so we split it into 5 chunks
+# Suppose our context is ~1M chars, and we want each sub-LLM query to be ~0.1M chars so we split it into 10 chunks
 chunk_size = len(context) // 10
-answers = []
+chunks = []
 for i in range(10):
     if i < 9:
         chunk_str = "\n".join(context[i*chunk_size:(i+1)*chunk_size])
     else:
         chunk_str = "\n".join(context[i*chunk_size:])
-    
-    answer = llm_query(f"Try to answer the following query: {{query}}. Here are the documents:\n{{chunk_str}}. Only answer if you are confident in your answer based on the evidence.")
-    answers.append(answer)
+    chunks.append(chunk_str)
+
+# Use batched query for concurrent processing - much faster than sequential calls!
+prompts = [f"Try to answer the following query: {{query}}. Here are the documents:\n{{chunk}}. Only answer if you are confident in your answer based on the evidence." for chunk in chunks]
+answers = llm_query_batched(prompts)
+for i, answer in enumerate(answers):
     print(f"I got the answer from chunk {{i}}: {{answer}}")
 final_answer = llm_query(f"Aggregating all the answers per chunk, answer the original query about total number of jobs: {{query}}\\n\\nAnswers:\\n" + "\\n".join(answers))
 ```

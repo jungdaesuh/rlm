@@ -19,11 +19,17 @@ To install the latest from `main`:
 pip install git+https://github.com/alexzhang13/rlm.git
 ```
 
-## Local Setup
+## Quick Setup
 ```
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv init && uv venv --python 3.12  # change version as needed
 uv pip install -e .
 ```
+
+### Local Environments
+
+### Isolated Environments
+
+```uv add modal```
 
 ## Reading
